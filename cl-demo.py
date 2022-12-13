@@ -14,6 +14,7 @@ from torch.autograd import Variable
 import torch.utils.data
 from matplotlib import pyplot as plt
 from podm.metrics import get_pascal_voc_metrics
+from sklearn.metrics import precision_score, recall_score
 
 def variable(t: torch.Tensor, use_cuda=True, **kwargs):
     if torch.cuda.is_available() and use_cuda:
@@ -145,9 +146,18 @@ def rearrange(logits, labels):
     labelWithCosDist[indices] = logits_detach[indices]
     return labelWithCosDist
 
-def showFrameWithPredictedBoxes(frame, coords, nameOfWindow):
-    for coord in coords:
+def showFrameWithPredictedBoxes(frame, coords, centroids, nameOfWindow):
+    for i, (coord, cent) in enumerate(zip(coords, centroids, strict=True)):
         cv2.rectangle(frame, (int(np.float32(coord[1])), int(np.float32(coord[0]))), (int(np.float32(coord[3])), int(np.float32(coord[2]))),(0,255,0))
+        cv2.circle(frame, (int(np.float32(cent[1])),int(np.float32(cent[0]))), radius=0, color=(0, 0, 255), thickness=-10)
+        cv2.putText(frame,str(i+1), (int(coord[1]),int(coord[0])),0, 0.5, (0,0,0),2)
+    cv2.imshow(nameOfWindow, frame)
+
+def showFrameWithPredictedBoxesCL(frame, coords, nameOfWindow):
+    for i, coord in enumerate(coords):
+        cv2.rectangle(frame, (int(np.float32(coord[1])), int(np.float32(coord[0]))), (int(np.float32(coord[3])), int(np.float32(coord[2]))),(0,255,0))
+        
+        cv2.putText(frame,str(i+1), (int(coord[1]),int(coord[0])),0, 0.5, (0,0,0),2)
     cv2.imshow(nameOfWindow, frame)
 
 def saveFrameIfAccBelowThres(frame, accuracy, negSample):
@@ -168,10 +178,7 @@ def getMSELoss(criterion, logits, labelWithCosDist, ewcFlag, model, negSample):
         return loss + ewc.penalty(model)
     return loss
 
-def getPR(detectedBbox, groundBbox):
-    p = 0
-    r = 0
-    return p,r
+
 
 def plotPR(p_vals, r_vals):
     plt.plot(p_vals, r_vals)
@@ -180,12 +187,11 @@ def plotPR(p_vals, r_vals):
     plt.ylabel("Recall")
 
 def savePR(detectedBbox, groundBbox):
-    p_vals=[]
-    r_vals=[]
-    p, r = getPR(detectedBbox, groundBbox)
+    p = precision_score(groundBbox,detectedBbox)
+    r = recall_score(groundBbox, detectedBbox)
     p_vals = p_vals.append(p)
     r_vals = r_vals.append(r)
-    return 0,0
+    return p_vals, r_vals
     
 
 def train(model, device, fish_coords, frame, num, negSample, posSample, ewcFlag):
@@ -217,14 +223,13 @@ def train(model, device, fish_coords, frame, num, negSample, posSample, ewcFlag)
         optimizer.step()
         train_running_loss += loss.detach().item()
         train_acc = accuracy(logits, labelWithCosDist)
-        p_vals,r_vals = savePR(labelWithCosDist*98, labels.clone().detach()*98)
         negSample = saveFrameIfAccBelowThres(images, train_acc, negSample)
         posSample = saveFrameIfAccAboveThres(images, train_acc, posSample)
         model.eval()
-        showFrameWithPredictedBoxes(frame, labelWithCosDist*98, "CL prediction")
+        # showFrameWithPredictedBoxesCL(frame, labelWithCosDist*98, "CL prediction")
         print('Frame: %d | Loss: %.4f | Train Accuracy: %.2f' \
               %(num, train_running_loss, train_acc))
-    return negSample, posSample, p_vals, r_vals
+    return negSample, posSample
 
 def test(testloader, model, device, BATCH_SIZE):
     test_acc = 0.0
@@ -241,28 +246,39 @@ def detect_fish(frame, backSubKNN):
     se=cv2.getStructuringElement(cv2.MORPH_RECT , (8,8))
     bg=cv2.morphologyEx(fgMaskKNN, cv2.MORPH_DILATE, se)
     bg=cv2.morphologyEx(fgMaskKNN, cv2.MORPH_CLOSE, se)
-    out_gray=cv2.divide(fgMaskKNN, bg, scale=255)
-    out_binary=cv2.threshold(out_gray, 0, 255, cv2.THRESH_OTSU)[1] 
-    fish_blobs = label(out_binary)
+    #out_gray=cv2.divide(fgMaskKNN, bg, scale=255)
+    #out_binary=cv2.threshold(out_gray, 0, 255, cv2.THRESH_OTSU)[1] 
+    fish_blobs = label(fgMaskKNN)
     cv2.imshow('blob', fgMaskKNN)
     properties = ['area', 'bbox', 'bbox_area','eccentricity','centroid']
     bbox_df = pd.DataFrame(regionprops_table(fish_blobs, properties = properties))
     bbox_df = bbox_df[(bbox_df['eccentricity'] < bbox_df['eccentricity'].max()) & (bbox_df['bbox_area'] > 100) & (bbox_df['bbox_area'] < 500)]
+    fish_centroid = [(row['centroid-0'], row['centroid-1']) for index,row in bbox_df.iterrows()]
     fish_coords = [(row['bbox-0'], row['bbox-1'],row['bbox-2'], row['bbox-3']) for index,row in bbox_df.iterrows()]
-    # fish_centroid = [bbox_df['centroid'] for index,row in bbox_df.iterrows()]
-    return fish_coords
+    
+    
+    return fish_coords, fish_centroid
 
 def normalizeCoord(coords):
     coord_arr = np.array(coords)
     coord_arr = coord_arr/98
     return coord_arr
 
-
+def costOfTracks(centroids, cost, tracks):
+    
+    if len(tracks) > 1:
+        costCurrPrev = np.zeros((len(centroids), len(tracks[-1])));
+        for i, curr in enumerate(centroids):
+            for j, prev in enumerate(tracks[-1]):
+                costCurrPrev[i][j] = ((curr[0] - prev[0])**2 + (curr[1] - prev[1])**2)**0.5
+        cost.append(costCurrPrev)
+    return cost
 
 def main():
     
     #testloader, trainloader = preprocess()
     tracks = []
+    costTrackToDetection = []
     negSample = torch.zeros([1,3,98,98])
     posSample = torch.zeros([1,3,98,98])
     cap = cv2.VideoCapture("./wells/crop-z-00.avi")
@@ -276,15 +292,20 @@ def main():
         cnt=cnt+1
         cv2.imshow('Original', frame)
         cv2.waitKey(50)
-        fish_coords = detect_fish(frame, backSubKNN)
+        fish_coords, fish_centroid = detect_fish(frame, backSubKNN)
+        if fish_centroid:
+            tracks.append(fish_centroid)
+        costTrackToDetection = costOfTracks(fish_centroid, costTrackToDetection, tracks)
+        if len(costTrackToDetection) > 1:
+            _,assignment = linear_sum_assignment(costTrackToDetection[-1])
         fish_coords_norm = normalizeCoord(fish_coords)
-        showFrameWithPredictedBoxes(frame, fish_coords, "blob detection")
-        # if fish_coords_norm.size > 0:
-        #     if cnt<20000:
-        #         negSample, posSample, p_vals, r_vals = train(model, device, fish_coords_norm, frame, cnt, negSample, posSample, False)
-        #     else:
-        #         negSample, posSample, p_vals, r_vals = train(model, device, fish_coords_norm, frame, cnt, negSample, posSample, True)
-        # # test(testloader, model, device, 32, fish_coords_norm, frame)
+        showFrameWithPredictedBoxes(frame, fish_coords, fish_centroid, "blob detection")
+        if fish_coords_norm.size > 0:
+            if cnt>2000:
+                negSample, posSample = train(model, device, fish_coords_norm, frame, cnt, negSample, posSample, False)
+            if cnt>20000:
+                negSample, posSample = train(model, device, fish_coords_norm, frame, cnt, negSample, posSample, True)
+    p_vals, r_vals = savePR()
     plotPR(p_vals, r_vals)
     cap.release()
     cv2.destroyAllWindows()
